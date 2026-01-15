@@ -97,10 +97,14 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 		return err
 	}
 
-	// Cleanup orphaned target groups
-	if err := m.cleanupOrphanedTargetGroups(ctx); err != nil {
-		m.logger.ErrorContext(ctx, "failed to cleanup orphaned target groups", "error", err)
-		return err
+	// Cleanup orphaned target groups (only if enabled)
+	if m.cfg.DeleteOrphanTargetGroups {
+		if err := m.cleanupOrphanedTargetGroups(ctx); err != nil {
+			m.logger.ErrorContext(ctx, "failed to cleanup orphaned target groups", "error", err)
+			return err
+		}
+	} else {
+		m.logger.InfoContext(ctx, "Orphan target group cleanup is disabled")
 	}
 
 	return nil
@@ -218,6 +222,15 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		return nil
 	}
 
+	// Check minimum instance count requirement
+	if len(targetNodes) < m.cfg.MinInstanceCount {
+		m.logger.WarnContext(ctx, "Insufficient target nodes to meet minimum instance count requirement",
+			"service", serviceKey,
+			"available_nodes", len(targetNodes),
+			"min_required", m.cfg.MinInstanceCount)
+		return nil
+	}
+
 	// Create target group name (must be unique and follow AWS naming rules)
 	targetGroupName := fmt.Sprintf("tgs-%s-%s", svc.Namespace, svc.Name)
 	if len(targetGroupName) > 32 {
@@ -244,7 +257,7 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		Port:       aws.Int32(nodePort),
 		Protocol:   types.ProtocolEnumTcp, // Default to TCP, could be made configurable
 		VpcId:      aws.String(m.cfg.VpcId),
-		TargetType: types.TargetTypeEnumInstance,
+		TargetType: types.TargetTypeEnumIp,
 		Tags: []types.Tag{
 			{
 				Key:   aws.String(TagKeyDeleteKey),
@@ -287,15 +300,15 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 
 // updateTargetGroupTargets updates the targets in a target group
 func (m *Manager) updateTargetGroupTargets(ctx context.Context, targetGroupArn string, targetNodes []corev1.Node) error {
-	// Prepare targets (using node instance IDs)
+	// Prepare targets (using node IP addresses)
 	targets := lo.FilterMap(targetNodes, func(node corev1.Node, _ int) (types.TargetDescription, bool) {
-		instanceID := m.extractInstanceIDFromProviderID(node.Spec.ProviderID)
-		if instanceID == "" {
-			m.logger.WarnContext(ctx, "Could not extract instance ID from node", "node", node.Name, "providerID", node.Spec.ProviderID)
+		nodeIP := m.extractNodeInternalIP(node)
+		if nodeIP == "" {
+			m.logger.WarnContext(ctx, "Could not extract internal IP from node", "node", node.Name)
 			return types.TargetDescription{}, false
 		}
 		return types.TargetDescription{
-			Id: aws.String(instanceID),
+			Id: aws.String(nodeIP),
 		}, true
 	})
 
@@ -503,5 +516,15 @@ func (m *Manager) extractInstanceIDFromProviderID(providerID string) string {
 		}
 	}
 
+	return ""
+}
+
+// extractNodeInternalIP extracts the internal IP address from a Kubernetes node
+func (m *Manager) extractNodeInternalIP(node corev1.Node) string {
+	for _, address := range node.Status.Addresses {
+		if address.Type == corev1.NodeInternalIP {
+			return address.Address
+		}
+	}
 	return ""
 }

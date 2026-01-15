@@ -111,11 +111,13 @@ func TestManagerRunOnce(t *testing.T) {
 	}))
 
 	cfg := config.Config{
-		IntervalSeconds:      30,
-		ClientTimeoutSeconds: 60,
-		MatchingLabelKey:     "targetgroup-senpai/enable",
-		MatchingLabelValue:   "true",
-		VpcId:                "vpc-12345678",
+		IntervalSeconds:          30,
+		ClientTimeoutSeconds:     60,
+		MatchingLabelKey:         "targetgroup-senpai/enable",
+		MatchingLabelValue:       "true",
+		VpcId:                    "vpc-12345678",
+		MinInstanceCount:         3,
+		DeleteOrphanTargetGroups: true,
 	}
 
 	// Create a fake k8s client with test services
@@ -172,6 +174,74 @@ func TestManagerRunOnce(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify mock expectations
+	mockELBv2Client.AssertExpectations(t)
+}
+
+func TestManagerRunOnceWithOrphanCleanupDisabled(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	cfg := config.Config{
+		IntervalSeconds:          30,
+		ClientTimeoutSeconds:     60,
+		MatchingLabelKey:         "targetgroup-senpai/enable",
+		MatchingLabelValue:       "true",
+		VpcId:                    "vpc-12345678",
+		MinInstanceCount:         3,
+		DeleteOrphanTargetGroups: false, // Disabled
+	}
+
+	// Create a fake k8s client with test services
+	services := []client.Object{
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-nodeport-service",
+				Namespace: "default",
+				Labels: map[string]string{
+					"targetgroup-senpai/enable": "true",
+				},
+			},
+			Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{
+					{
+						Port:     80,
+						NodePort: 30080,
+					},
+				},
+			},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-clusterip-service",
+				Namespace: "default",
+				Labels: map[string]string{
+					"targetgroup-senpai/enable": "true",
+				},
+			},
+			Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeClusterIP,
+			},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().WithObjects(services...).Build()
+
+	// Create mock ELBv2 client
+	mockELBv2Client := &MockELBv2Client{}
+
+	// NOTE: No expectations set for DescribeTargetGroups since orphan cleanup is disabled
+
+	// Create manager with mock dependencies
+	manager := NewManager(cfg, k8sClient, mockELBv2Client, logger)
+
+	// Test RunOnce
+	err := manager.RunOnce(ctx)
+	assert.NoError(t, err)
+
+	// Verify mock expectations (should have no calls to DescribeTargetGroups)
 	mockELBv2Client.AssertExpectations(t)
 }
 
@@ -738,19 +808,29 @@ func TestUpdateTargetGroupTargets(t *testing.T) {
 			targetNodes: []corev1.Node{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "node1"},
-					Spec: corev1.NodeSpec{
-						ProviderID: "aws:///us-west-2a/i-1234567890abcdef0",
+					Status: corev1.NodeStatus{
+						Addresses: []corev1.NodeAddress{
+							{
+								Type:    corev1.NodeInternalIP,
+								Address: "10.0.1.100",
+							},
+						},
 					},
 				},
 			},
 		},
 		{
-			name: "handles nodes without valid provider ID",
+			name: "handles nodes without internal IP",
 			targetNodes: []corev1.Node{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "node1"},
-					Spec: corev1.NodeSpec{
-						ProviderID: "invalid-provider-id",
+					Status: corev1.NodeStatus{
+						Addresses: []corev1.NodeAddress{
+							{
+								Type:    corev1.NodeExternalIP,
+								Address: "192.168.1.100",
+							},
+						},
 					},
 				},
 			},
@@ -760,8 +840,13 @@ func TestUpdateTargetGroupTargets(t *testing.T) {
 			targetNodes: []corev1.Node{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "node1"},
-					Spec: corev1.NodeSpec{
-						ProviderID: "aws:///us-west-2a/i-1234567890abcdef0",
+					Status: corev1.NodeStatus{
+						Addresses: []corev1.NodeAddress{
+							{
+								Type:    corev1.NodeInternalIP,
+								Address: "10.0.1.100",
+							},
+						},
 					},
 				},
 			},
@@ -1058,6 +1143,157 @@ func TestExtractInstanceIDFromProviderID(t *testing.T) {
 	}
 }
 
+func TestExtractNodeInternalIP(t *testing.T) {
+	tests := []struct {
+		name     string
+		node     corev1.Node
+		expected string
+	}{
+		{
+			name: "extracts internal IP from node addresses",
+			node: corev1.Node{
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeExternalIP, Address: "203.0.113.1"},
+						{Type: corev1.NodeInternalIP, Address: "10.0.1.100"},
+					},
+				},
+			},
+			expected: "10.0.1.100",
+		},
+		{
+			name: "returns empty when no internal IP exists",
+			node: corev1.Node{
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeExternalIP, Address: "203.0.113.1"},
+					},
+				},
+			},
+			expected: "",
+		},
+		{
+			name: "returns empty for node with no addresses",
+			node: corev1.Node{
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{},
+				},
+			},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewManager(config.Config{}, fake.NewClientBuilder().Build(), &MockELBv2Client{}, slog.Default())
+			result := manager.extractNodeInternalIP(tt.node)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestEnsureTargetGroupForServiceMinInstanceCount(t *testing.T) {
+	tests := []struct {
+		name             string
+		service          corev1.Service
+		targetNodes      []corev1.Node
+		minInstanceCount int
+		expectCreate     bool
+		expectWarning    bool
+	}{
+		{
+			name: "creates target group when meeting minimum instance count",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{NodePort: 30080},
+					},
+				},
+			},
+			targetNodes: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node2"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node3"}},
+			},
+			minInstanceCount: 3,
+			expectCreate:     true,
+		},
+		{
+			name: "skips target group creation when below minimum instance count",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{NodePort: 30080},
+					},
+				},
+			},
+			targetNodes: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node2"}},
+			},
+			minInstanceCount: 3,
+			expectCreate:     false,
+			expectWarning:    true,
+		},
+		{
+			name: "creates target group when exceeding minimum instance count",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{NodePort: 30080},
+					},
+				},
+			},
+			targetNodes: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node2"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node3"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node4"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node5"}},
+			},
+			minInstanceCount: 3,
+			expectCreate:     true,
+		},
+		{
+			name: "creates target group when minimum instance count is 1",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{NodePort: 30080},
+					},
+				},
+			},
+			targetNodes: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+			},
+			minInstanceCount: 1,
+			expectCreate:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{
+				VpcId:            "vpc-test",
+				MinInstanceCount: tt.minInstanceCount,
+				DryRun:           true, // Use dry run to avoid complex mocking
+			}
+
+			mockELB := &MockELBv2Client{}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			manager := NewManager(cfg, fake.NewClientBuilder().Build(), mockELB, logger)
+
+			err := manager.ensureTargetGroupForService(context.Background(), tt.service, tt.targetNodes)
+
+			assert.NoError(t, err)
+		})
+	}
+}
+
 func TestEnsureTargetGroupsForNodePortServices(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1082,8 +1318,13 @@ func TestEnsureTargetGroupsForNodePortServices(t *testing.T) {
 			readyNodes: []corev1.Node{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "node1"},
-					Spec: corev1.NodeSpec{
-						ProviderID: "aws:///us-west-2a/i-1234567890abcdef0",
+					Status: corev1.NodeStatus{
+						Addresses: []corev1.NodeAddress{
+							{
+								Type:    corev1.NodeInternalIP,
+								Address: "10.0.1.100",
+							},
+						},
 					},
 				},
 			},

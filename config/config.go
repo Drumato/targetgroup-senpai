@@ -9,12 +9,14 @@ import (
 )
 
 const (
-	defaultIntervalSeconds    = 60
-	defaultLogLevel           = "info"
-	defaultDryRun             = false
-	defaultClientTimeout      = 10
-	defaultMatchingLabelKey   = "app.kubernetes.io/managed-by"
-	defaultMatchingLabelValue = "targetgroup-senpai"
+	defaultIntervalSeconds          = 60
+	defaultLogLevel                 = "info"
+	defaultDryRun                   = false
+	defaultClientTimeout            = 10
+	defaultMatchingLabelKey         = "app.kubernetes.io/managed-by"
+	defaultMatchingLabelValue       = "targetgroup-senpai"
+	defaultMinInstanceCount         = 3
+	defaultDeleteOrphanTargetGroups = true
 )
 
 type Config struct {
@@ -30,6 +32,10 @@ type Config struct {
 	MatchingLabelValue string
 	// VpcId is the VPC ID where target groups will be created
 	VpcId string
+	// MinInstanceCount is the minimum number of instances required for target group operations
+	MinInstanceCount int
+	// DeleteOrphanTargetGroups controls whether to delete target groups without corresponding services
+	DeleteOrphanTargetGroups bool
 }
 
 type configField struct {
@@ -91,12 +97,14 @@ func loadConfigFieldFromEnv(err error, pair configField, _ int) error {
 
 func LoadConfigFromEnv() (Config, error) {
 	cfg := Config{
-		IntervalSeconds:      defaultIntervalSeconds,
-		LogLevel:             defaultLogLevel,
-		DryRun:               defaultDryRun,
-		ClientTimeoutSeconds: defaultClientTimeout,
-		MatchingLabelKey:     defaultMatchingLabelKey,
-		MatchingLabelValue:   defaultMatchingLabelValue,
+		IntervalSeconds:          defaultIntervalSeconds,
+		LogLevel:                 defaultLogLevel,
+		DryRun:                   defaultDryRun,
+		ClientTimeoutSeconds:     defaultClientTimeout,
+		MatchingLabelKey:         defaultMatchingLabelKey,
+		MatchingLabelValue:       defaultMatchingLabelValue,
+		MinInstanceCount:         defaultMinInstanceCount,
+		DeleteOrphanTargetGroups: defaultDeleteOrphanTargetGroups,
 	}
 
 	pairs := []configField{
@@ -106,6 +114,8 @@ func LoadConfigFromEnv() (Config, error) {
 		{"CLIENT_TIMEOUT_SECONDS", &cfg.ClientTimeoutSeconds, defaultClientTimeout, true},
 		{"MATCHING_LABEL_KEY", &cfg.MatchingLabelKey, defaultMatchingLabelKey, true},
 		{"MATCHING_LABEL_VALUE", &cfg.MatchingLabelValue, defaultMatchingLabelValue, true},
+		{"MIN_INSTANCE_COUNT", &cfg.MinInstanceCount, defaultMinInstanceCount, true},
+		{"DELETE_ORPHAN_TARGET_GROUPS", &cfg.DeleteOrphanTargetGroups, defaultDeleteOrphanTargetGroups, true},
 		{"VPC_ID", &cfg.VpcId, "", false},
 	}
 
