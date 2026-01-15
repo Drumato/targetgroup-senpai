@@ -234,6 +234,7 @@ func TestManagerStart(t *testing.T) {
 			manager := NewManager(cfg, client, mockELB, logger)
 
 			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
 			done := make(chan error, 1)
 			go func() {
