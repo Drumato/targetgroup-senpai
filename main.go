@@ -12,6 +12,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -43,10 +44,21 @@ func main() {
 		Level: logLevel,
 	}))
 
+	// Try to get in-cluster config first, fallback to kubeconfig if it fails
 	restConfig, err := rest.InClusterConfig()
 	if err != nil {
-		logger.ErrorContext(ctx, "Failed to get in-cluster config", "error", err)
-		os.Exit(1)
+		logger.InfoContext(ctx, "Failed to get in-cluster config, trying kubeconfig", "error", err)
+
+		// Try to load from default kubeconfig location
+		restConfig, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+		if err != nil {
+			logger.ErrorContext(ctx, "Failed to load kubeconfig", "error", err)
+			os.Exit(1)
+		}
+
+		logger.InfoContext(ctx, "Successfully loaded kubeconfig")
+	} else {
+		logger.InfoContext(ctx, "Successfully loaded in-cluster config")
 	}
 	k8sClient, err := client.New(restConfig, client.Options{})
 	if err != nil {

@@ -50,8 +50,20 @@ func loadConfigFieldFromEnv(err error, pair configField, _ int) error {
 		return fmt.Errorf("environment variable %s is required", pair.envKey)
 	}
 
+	// If the environment variable doesn't exist, use default value
+	if !exists {
+		return nil
+	}
+
 	switch v := pair.value.(type) {
 	case *int:
+		// If empty string and optional, use default value
+		if envValue == "" && pair.optional {
+			if defaultVal, ok := pair.defaultValue.(int); ok {
+				*v = defaultVal
+			}
+			return nil
+		}
 		parsed, err := strconv.Atoi(envValue)
 		if err != nil {
 			return err
@@ -60,6 +72,13 @@ func loadConfigFieldFromEnv(err error, pair configField, _ int) error {
 	case *string:
 		*v = envValue
 	case *bool:
+		// If empty string and optional, use default value
+		if envValue == "" && pair.optional {
+			if defaultVal, ok := pair.defaultValue.(bool); ok {
+				*v = defaultVal
+			}
+			return nil
+		}
 		parsed, err := strconv.ParseBool(envValue)
 		if err != nil {
 			return err
