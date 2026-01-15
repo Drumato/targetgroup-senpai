@@ -9,6 +9,8 @@ import (
 
 	"github.com/Drumato/targetgroup-senpai/config"
 	"github.com/Drumato/targetgroup-senpai/manager"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -52,7 +54,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := manager.NewManager(cfg, k8sClient, logger)
+	// Initialize AWS config with automatic credential detection
+	// This will use AWS_PROFILE if set, or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY if available
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to load AWS config", "error", err)
+		os.Exit(1)
+	}
+
+	// Create ELBv2 client for Target Group operations
+	elbv2Client := elasticloadbalancingv2.NewFromConfig(awsCfg)
+
+	m := manager.NewManager(cfg, k8sClient, elbv2Client, logger)
 
 	if err := m.Start(ctx); err != nil {
 		logger.ErrorContext(ctx, "Manager exited with error", "error", err)

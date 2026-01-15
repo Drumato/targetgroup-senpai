@@ -1,8 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/samber/lo"
 )
 
 const (
@@ -25,6 +28,46 @@ type Config struct {
 	// MatchingLabelValue is the label value to match resources
 	// e.g., `targetgroup-senpai`
 	MatchingLabelValue string
+	// VpcId is the VPC ID where target groups will be created
+	VpcId string
+}
+
+type configField struct {
+	envKey       string
+	value        interface{}
+	defaultValue interface{}
+	optional     bool
+}
+
+func loadConfigFieldFromEnv(err error, pair configField, _ int) error {
+	// propagate previous error
+	if err != nil {
+		return err
+	}
+
+	envValue, exists := os.LookupEnv(pair.envKey)
+	if !exists && !pair.optional {
+		return fmt.Errorf("environment variable %s is required", pair.envKey)
+	}
+
+	switch v := pair.value.(type) {
+	case *int:
+		parsed, err := strconv.Atoi(envValue)
+		if err != nil {
+			return err
+		}
+		*v = parsed
+	case *string:
+		*v = envValue
+	case *bool:
+		parsed, err := strconv.ParseBool(envValue)
+		if err != nil {
+			return err
+		}
+		*v = parsed
+	}
+
+	return nil
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -37,32 +80,19 @@ func LoadConfigFromEnv() (Config, error) {
 		MatchingLabelValue:   defaultMatchingLabelValue,
 	}
 
-	// required
+	pairs := []configField{
+		{"INTERVAL_SECONDS", &cfg.IntervalSeconds, defaultIntervalSeconds, true},
+		{"LOG_LEVEL", &cfg.LogLevel, defaultLogLevel, true},
+		{"DRY_RUN", &cfg.DryRun, defaultDryRun, true},
+		{"CLIENT_TIMEOUT_SECONDS", &cfg.ClientTimeoutSeconds, defaultClientTimeout, true},
+		{"MATCHING_LABEL_KEY", &cfg.MatchingLabelKey, defaultMatchingLabelKey, true},
+		{"MATCHING_LABEL_VALUE", &cfg.MatchingLabelValue, defaultMatchingLabelValue, true},
+		{"VPC_ID", &cfg.VpcId, "", false},
+	}
 
-	// optional
-	if v, ok := os.LookupEnv("MATCHING_LABEL_KEY"); ok {
-		cfg.MatchingLabelKey = v
+	if err := lo.Reduce(pairs, loadConfigFieldFromEnv, nil); err != nil {
+		return Config{}, err
 	}
-	if v, ok := os.LookupEnv("MATCHING_LABEL_VALUE"); ok {
-		cfg.MatchingLabelValue = v
-	}
-	if v, ok := os.LookupEnv("CLIENT_TIMEOUT_SECONDS"); ok {
-		if secs, err := strconv.Atoi(v); err == nil {
-			cfg.ClientTimeoutSeconds = secs
-		}
-	}
-	if v, ok := os.LookupEnv("LOG_LEVEL"); ok {
-		cfg.LogLevel = v
-	}
-	if v, ok := os.LookupEnv("INTERVAL_SECONDS"); ok {
-		if secs, err := strconv.Atoi(v); err == nil {
-			cfg.IntervalSeconds = secs
-		}
-	}
-	if v, ok := os.LookupEnv("DRY_RUN"); ok {
-		if dryRun, err := strconv.ParseBool(v); err == nil {
-			cfg.DryRun = dryRun
-		}
-	}
+
 	return cfg, nil
 }
