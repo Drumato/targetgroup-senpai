@@ -455,21 +455,31 @@ func (m *Manager) cleanupOrphanedTargetGroups(ctx context.Context) error {
 		return nil
 	}
 
-	// Get tags for all target groups
-	describeTagsInput := &elasticloadbalancingv2.DescribeTagsInput{
-		ResourceArns: targetGroupArns,
-	}
-
-	tagsOutput, err := m.elbv2Client.DescribeTags(ctx, describeTagsInput)
-	if err != nil {
-		return fmt.Errorf("failed to describe tags: %w", err)
-	}
-
-	// Create map of target group ARN to tags
+	// Get tags for all target groups (in chunks of 20 due to AWS API limit)
 	tagsByArn := make(map[string][]types.Tag)
-	for _, tagDescription := range tagsOutput.TagDescriptions {
-		if tagDescription.ResourceArn != nil {
-			tagsByArn[*tagDescription.ResourceArn] = tagDescription.Tags
+	const maxResourcesPerDescribeTagsCall = 20
+
+	for i := 0; i < len(targetGroupArns); i += maxResourcesPerDescribeTagsCall {
+		end := i + maxResourcesPerDescribeTagsCall
+		if end > len(targetGroupArns) {
+			end = len(targetGroupArns)
+		}
+
+		chunk := targetGroupArns[i:end]
+		describeTagsInput := &elasticloadbalancingv2.DescribeTagsInput{
+			ResourceArns: chunk,
+		}
+
+		tagsOutput, err := m.elbv2Client.DescribeTags(ctx, describeTagsInput)
+		if err != nil {
+			return fmt.Errorf("failed to describe tags for chunk %d-%d: %w", i, end, err)
+		}
+
+		// Add tags from this chunk to the map
+		for _, tagDescription := range tagsOutput.TagDescriptions {
+			if tagDescription.ResourceArn != nil {
+				tagsByArn[*tagDescription.ResourceArn] = tagDescription.Tags
+			}
 		}
 	}
 
