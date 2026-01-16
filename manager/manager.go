@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,15 @@ import (
 const (
 	// TagKeyDeleteKey is the key for the tag that indicates which service this target group belongs to
 	TagKeyDeleteKey = "targetgroup-senpai-delete-key"
+
+	// Health Check Annotation Keys
+	AnnotationHealthCheckType               = "targetgroup-senpai.drumato.com/healthcheck-type"
+	AnnotationHealthCheckPath               = "targetgroup-senpai.drumato.com/healthcheck-path"
+	AnnotationHealthCheckPort               = "targetgroup-senpai.drumato.com/healthcheck-port"
+	AnnotationHealthCheckInterval           = "targetgroup-senpai.drumato.com/healthcheck-interval"
+	AnnotationHealthCheckTimeout            = "targetgroup-senpai.drumato.com/healthcheck-timeout"
+	AnnotationHealthCheckHealthyThreshold   = "targetgroup-senpai.drumato.com/healthcheck-healthy-threshold"
+	AnnotationHealthCheckUnhealthyThreshold = "targetgroup-senpai.drumato.com/healthcheck-unhealthy-threshold"
 )
 
 // ELBv2Client defines the interface for ELBv2 operations needed by the manager
@@ -30,6 +40,17 @@ type ELBv2Client interface {
 	RegisterTargets(ctx context.Context, params *elasticloadbalancingv2.RegisterTargetsInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.RegisterTargetsOutput, error)
 	DeregisterTargets(ctx context.Context, params *elasticloadbalancingv2.DeregisterTargetsInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DeregisterTargetsOutput, error)
 	DeleteTargetGroup(ctx context.Context, params *elasticloadbalancingv2.DeleteTargetGroupInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DeleteTargetGroupOutput, error)
+}
+
+// ServiceHealthCheckConfig holds the parsed health check configuration for a service
+type ServiceHealthCheckConfig struct {
+	Type               string
+	Path               string
+	Port               int32
+	IntervalSeconds    int32
+	TimeoutSeconds     int32
+	HealthyThreshold   int32
+	UnhealthyThreshold int32
 }
 
 type Manager struct {
@@ -251,13 +272,44 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		return fmt.Errorf("no NodePort found for service %s", serviceKey)
 	}
 
-	// Create target group
+	// Parse health check configuration from service annotations
+	healthCheckConfig, err := m.parseHealthCheckConfig(svc, nodePort)
+	if err != nil {
+		return fmt.Errorf("failed to parse health check configuration for service %s: %w", serviceKey, err)
+	}
+
+	// Determine protocol based on health check type
+	var protocol types.ProtocolEnum
+	var healthCheckProtocol types.ProtocolEnum
+
+	switch healthCheckConfig.Type {
+	case "tcp":
+		protocol = types.ProtocolEnumTcp
+		healthCheckProtocol = types.ProtocolEnumTcp
+	case "http":
+		protocol = types.ProtocolEnumTcp // Target group protocol is still TCP, health check is HTTP
+		healthCheckProtocol = types.ProtocolEnumHttp
+	case "https":
+		protocol = types.ProtocolEnumTcp // Target group protocol is still TCP, health check is HTTPS
+		healthCheckProtocol = types.ProtocolEnumHttps
+	default:
+		protocol = types.ProtocolEnumTcp
+		healthCheckProtocol = types.ProtocolEnumTcp
+	}
+
+	// Create target group with health check configuration
 	createInput := &elasticloadbalancingv2.CreateTargetGroupInput{
-		Name:       aws.String(targetGroupName),
-		Port:       aws.Int32(nodePort),
-		Protocol:   types.ProtocolEnumTcp, // Default to TCP, could be made configurable
-		VpcId:      aws.String(m.cfg.VpcId),
-		TargetType: types.TargetTypeEnumIp,
+		Name:                       aws.String(targetGroupName),
+		Port:                       aws.Int32(nodePort),
+		Protocol:                   protocol,
+		VpcId:                      aws.String(m.cfg.VpcId),
+		TargetType:                 types.TargetTypeEnumIp,
+		HealthCheckProtocol:        healthCheckProtocol,
+		HealthCheckPort:            aws.String(fmt.Sprintf("%d", healthCheckConfig.Port)),
+		HealthCheckIntervalSeconds: aws.Int32(healthCheckConfig.IntervalSeconds),
+		HealthCheckTimeoutSeconds:  aws.Int32(healthCheckConfig.TimeoutSeconds),
+		HealthyThresholdCount:      aws.Int32(healthCheckConfig.HealthyThreshold),
+		UnhealthyThresholdCount:    aws.Int32(healthCheckConfig.UnhealthyThreshold),
 		Tags: []types.Tag{
 			{
 				Key:   aws.String(TagKeyDeleteKey),
@@ -266,7 +318,18 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		},
 	}
 
-	m.logger.InfoContext(ctx, "Creating target group", "name", targetGroupName, "service", serviceKey, "nodePort", nodePort)
+	// Add health check path for HTTP/HTTPS protocols
+	if healthCheckConfig.Type == "http" || healthCheckConfig.Type == "https" {
+		createInput.HealthCheckPath = aws.String(healthCheckConfig.Path)
+	}
+
+	m.logger.InfoContext(ctx, "Creating target group",
+		"name", targetGroupName,
+		"service", serviceKey,
+		"nodePort", nodePort,
+		"healthCheckType", healthCheckConfig.Type,
+		"healthCheckPort", healthCheckConfig.Port,
+		"healthCheckPath", healthCheckConfig.Path)
 
 	if m.cfg.DryRun {
 		m.logger.InfoContext(ctx, "DRY RUN: Would create target group", "input", createInput)
@@ -528,4 +591,118 @@ func (m *Manager) extractNodeInternalIP(node corev1.Node) string {
 		}
 	}
 	return ""
+}
+
+// parseHealthCheckConfig extracts and validates health check configuration from service annotations
+func (m *Manager) parseHealthCheckConfig(svc corev1.Service, servicePort int32) (*ServiceHealthCheckConfig, error) {
+	config := &ServiceHealthCheckConfig{
+		Type:               m.cfg.HealthCheck.DefaultType,
+		Path:               m.cfg.HealthCheck.DefaultPath,
+		Port:               servicePort, // Default to service port
+		IntervalSeconds:    m.cfg.HealthCheck.DefaultIntervalSeconds,
+		TimeoutSeconds:     m.cfg.HealthCheck.DefaultTimeoutSeconds,
+		HealthyThreshold:   m.cfg.HealthCheck.DefaultHealthyThreshold,
+		UnhealthyThreshold: m.cfg.HealthCheck.DefaultUnhealthyThreshold,
+	}
+
+	if svc.Annotations == nil {
+		return config, nil
+	}
+
+	// Parse health check type
+	if healthCheckType, exists := svc.Annotations[AnnotationHealthCheckType]; exists {
+		healthCheckType = strings.ToLower(strings.TrimSpace(healthCheckType))
+		switch healthCheckType {
+		case "tcp", "http", "https":
+			config.Type = healthCheckType
+		default:
+			return nil, fmt.Errorf("invalid health check type '%s', must be one of: tcp, http, https", healthCheckType)
+		}
+	}
+
+	// Parse health check path (only valid for HTTP/HTTPS)
+	if path, exists := svc.Annotations[AnnotationHealthCheckPath]; exists {
+		if config.Type == "tcp" {
+			return nil, fmt.Errorf("health check path is not valid for TCP health checks")
+		}
+		if path = strings.TrimSpace(path); path == "" {
+			return nil, fmt.Errorf("health check path cannot be empty for HTTP/HTTPS health checks")
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		config.Path = path
+	}
+
+	// Parse health check port
+	if portStr, exists := svc.Annotations[AnnotationHealthCheckPort]; exists {
+		port, err := strconv.ParseInt(strings.TrimSpace(portStr), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid health check port '%s': %w", portStr, err)
+		}
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("health check port %d must be between 1 and 65535", port)
+		}
+		config.Port = int32(port)
+	}
+
+	// Parse health check interval
+	if intervalStr, exists := svc.Annotations[AnnotationHealthCheckInterval]; exists {
+		interval, err := strconv.ParseInt(strings.TrimSpace(intervalStr), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid health check interval '%s': %w", intervalStr, err)
+		}
+		if interval < 5 || interval > 300 {
+			return nil, fmt.Errorf("health check interval %d must be between 5 and 300 seconds", interval)
+		}
+		config.IntervalSeconds = int32(interval)
+	}
+
+	// Parse health check timeout
+	if timeoutStr, exists := svc.Annotations[AnnotationHealthCheckTimeout]; exists {
+		timeout, err := strconv.ParseInt(strings.TrimSpace(timeoutStr), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid health check timeout '%s': %w", timeoutStr, err)
+		}
+		if timeout < 2 || timeout > 120 {
+			return nil, fmt.Errorf("health check timeout %d must be between 2 and 120 seconds", timeout)
+		}
+		config.TimeoutSeconds = int32(timeout)
+	}
+
+	// Parse healthy threshold
+	if thresholdStr, exists := svc.Annotations[AnnotationHealthCheckHealthyThreshold]; exists {
+		threshold, err := strconv.ParseInt(strings.TrimSpace(thresholdStr), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid health check healthy threshold '%s': %w", thresholdStr, err)
+		}
+		if threshold < 2 || threshold > 10 {
+			return nil, fmt.Errorf("health check healthy threshold %d must be between 2 and 10", threshold)
+		}
+		config.HealthyThreshold = int32(threshold)
+	}
+
+	// Parse unhealthy threshold
+	if thresholdStr, exists := svc.Annotations[AnnotationHealthCheckUnhealthyThreshold]; exists {
+		threshold, err := strconv.ParseInt(strings.TrimSpace(thresholdStr), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid health check unhealthy threshold '%s': %w", thresholdStr, err)
+		}
+		if threshold < 2 || threshold > 10 {
+			return nil, fmt.Errorf("health check unhealthy threshold %d must be between 2 and 10", threshold)
+		}
+		config.UnhealthyThreshold = int32(threshold)
+	}
+
+	// Validate that timeout is less than interval
+	if config.TimeoutSeconds >= config.IntervalSeconds {
+		return nil, fmt.Errorf("health check timeout (%d) must be less than interval (%d)", config.TimeoutSeconds, config.IntervalSeconds)
+	}
+
+	// Validate path is set for HTTP/HTTPS
+	if (config.Type == "http" || config.Type == "https") && config.Path == "" {
+		config.Path = m.cfg.HealthCheck.DefaultPath
+	}
+
+	return config, nil
 }

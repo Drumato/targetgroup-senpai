@@ -118,6 +118,14 @@ func TestManagerRunOnce(t *testing.T) {
 		VpcId:                    "vpc-12345678",
 		MinInstanceCount:         3,
 		DeleteOrphanTargetGroups: true,
+		HealthCheck: config.HealthCheckConfig{
+			DefaultType:               "tcp",
+			DefaultPath:               "/",
+			DefaultIntervalSeconds:    30,
+			DefaultTimeoutSeconds:     5,
+			DefaultHealthyThreshold:   2,
+			DefaultUnhealthyThreshold: 2,
+		},
 	}
 
 	// Create a fake k8s client with test services
@@ -1355,6 +1363,265 @@ func TestEnsureTargetGroupsForNodePortServices(t *testing.T) {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestParseHealthCheckConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		service     corev1.Service
+		servicePort int32
+		expectError bool
+		expected    *ServiceHealthCheckConfig
+	}{
+		{
+			name: "default TCP health check configuration",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-svc",
+					Namespace: "default",
+				},
+			},
+			servicePort: 30080,
+			expected: &ServiceHealthCheckConfig{
+				Type:               "tcp",
+				Path:               "/",
+				Port:               30080,
+				IntervalSeconds:    30,
+				TimeoutSeconds:     5,
+				HealthyThreshold:   2,
+				UnhealthyThreshold: 2,
+			},
+		},
+		{
+			name: "HTTP health check with custom path",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationHealthCheckType: "http",
+						AnnotationHealthCheckPath: "/health",
+					},
+				},
+			},
+			servicePort: 30080,
+			expected: &ServiceHealthCheckConfig{
+				Type:               "http",
+				Path:               "/health",
+				Port:               30080,
+				IntervalSeconds:    30,
+				TimeoutSeconds:     5,
+				HealthyThreshold:   2,
+				UnhealthyThreshold: 2,
+			},
+		},
+		{
+			name: "HTTPS health check with all custom settings",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationHealthCheckType:               "https",
+						AnnotationHealthCheckPath:               "/api/health",
+						AnnotationHealthCheckPort:               "30443",
+						AnnotationHealthCheckInterval:           "60",
+						AnnotationHealthCheckTimeout:            "10",
+						AnnotationHealthCheckHealthyThreshold:   "3",
+						AnnotationHealthCheckUnhealthyThreshold: "5",
+					},
+				},
+			},
+			servicePort: 30080,
+			expected: &ServiceHealthCheckConfig{
+				Type:               "https",
+				Path:               "/api/health",
+				Port:               30443,
+				IntervalSeconds:    60,
+				TimeoutSeconds:     10,
+				HealthyThreshold:   3,
+				UnhealthyThreshold: 5,
+			},
+		},
+		{
+			name: "invalid health check type",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationHealthCheckType: "invalid",
+					},
+				},
+			},
+			servicePort: 30080,
+			expectError: true,
+		},
+		{
+			name: "TCP health check with path annotation (should fail)",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationHealthCheckType: "tcp",
+						AnnotationHealthCheckPath: "/health",
+					},
+				},
+			},
+			servicePort: 30080,
+			expectError: true,
+		},
+		{
+			name: "timeout greater than interval",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationHealthCheckInterval: "10",
+						AnnotationHealthCheckTimeout:  "15",
+					},
+				},
+			},
+			servicePort: 30080,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{
+				HealthCheck: config.HealthCheckConfig{
+					DefaultType:               "tcp",
+					DefaultPath:               "/",
+					DefaultIntervalSeconds:    30,
+					DefaultTimeoutSeconds:     5,
+					DefaultHealthyThreshold:   2,
+					DefaultUnhealthyThreshold: 2,
+				},
+			}
+
+			manager := NewManager(cfg, fake.NewClientBuilder().Build(), &MockELBv2Client{}, slog.Default())
+
+			result, err := manager.parseHealthCheckConfig(tt.service, tt.servicePort)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestEnsureTargetGroupForServiceWithHealthCheck(t *testing.T) {
+	tests := []struct {
+		name                string
+		service             corev1.Service
+		targetNodes         []corev1.Node
+		expectCreate        bool
+		validateHealthCheck func(t *testing.T, input *elasticloadbalancingv2.CreateTargetGroupInput)
+	}{
+		{
+			name: "TCP health check creates target group with TCP protocol",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tcp-svc",
+					Namespace: "default",
+				},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{{NodePort: 30080}},
+				},
+			},
+			targetNodes:  []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}},
+			expectCreate: true,
+			validateHealthCheck: func(t *testing.T, input *elasticloadbalancingv2.CreateTargetGroupInput) {
+				assert.Equal(t, types.ProtocolEnumTcp, input.Protocol)
+				assert.Equal(t, types.ProtocolEnumTcp, input.HealthCheckProtocol)
+				assert.Equal(t, "30080", *input.HealthCheckPort)
+				assert.Equal(t, int32(30), *input.HealthCheckIntervalSeconds)
+				assert.Equal(t, int32(5), *input.HealthCheckTimeoutSeconds)
+				assert.Equal(t, int32(2), *input.HealthyThresholdCount)
+				assert.Equal(t, int32(2), *input.UnhealthyThresholdCount)
+				assert.Nil(t, input.HealthCheckPath)
+			},
+		},
+		{
+			name: "HTTP health check creates target group with HTTP health check",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "http-svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationHealthCheckType: "http",
+						AnnotationHealthCheckPath: "/health",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{{NodePort: 30080}},
+				},
+			},
+			targetNodes:  []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}},
+			expectCreate: true,
+			validateHealthCheck: func(t *testing.T, input *elasticloadbalancingv2.CreateTargetGroupInput) {
+				assert.Equal(t, types.ProtocolEnumTcp, input.Protocol)
+				assert.Equal(t, types.ProtocolEnumHttp, input.HealthCheckProtocol)
+				assert.Equal(t, "/health", *input.HealthCheckPath)
+				assert.Equal(t, "30080", *input.HealthCheckPort)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{
+				VpcId: "vpc-test",
+				HealthCheck: config.HealthCheckConfig{
+					DefaultType:               "tcp",
+					DefaultPath:               "/",
+					DefaultIntervalSeconds:    30,
+					DefaultTimeoutSeconds:     5,
+					DefaultHealthyThreshold:   2,
+					DefaultUnhealthyThreshold: 2,
+				},
+			}
+
+			mockELB := &MockELBv2Client{}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			manager := NewManager(cfg, fake.NewClientBuilder().Build(), mockELB, logger)
+
+			if tt.expectCreate {
+				// Mock DescribeTargetGroups to return empty (target group doesn't exist)
+				mockELB.On("DescribeTargetGroups", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.DescribeTargetGroupsInput")).
+					Return(&elasticloadbalancingv2.DescribeTargetGroupsOutput{TargetGroups: []types.TargetGroup{}}, nil)
+
+				// Mock CreateTargetGroup with validation
+				mockELB.On("CreateTargetGroup", mock.Anything, mock.MatchedBy(func(input *elasticloadbalancingv2.CreateTargetGroupInput) bool {
+					if tt.validateHealthCheck != nil {
+						tt.validateHealthCheck(t, input)
+					}
+					return true
+				})).Return(&elasticloadbalancingv2.CreateTargetGroupOutput{
+					TargetGroups: []types.TargetGroup{
+						{TargetGroupArn: aws.String("arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/test/1234567890123456")},
+					},
+				}, nil)
+
+				// Mock RegisterTargets
+				mockELB.On("RegisterTargets", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.RegisterTargetsInput")).
+					Return(&elasticloadbalancingv2.RegisterTargetsOutput{}, nil)
+			}
+
+			err := manager.ensureTargetGroupForService(context.Background(), tt.service, tt.targetNodes)
+			assert.NoError(t, err)
+
+			if tt.expectCreate {
+				mockELB.AssertExpectations(t)
 			}
 		})
 	}

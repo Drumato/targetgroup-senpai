@@ -17,7 +17,24 @@ const (
 	defaultMatchingLabelValue       = "targetgroup-senpai"
 	defaultMinInstanceCount         = 3
 	defaultDeleteOrphanTargetGroups = true
+
+	// Health Check Defaults
+	defaultHealthCheckType               = "tcp"
+	defaultHealthCheckPath               = "/"
+	defaultHealthCheckIntervalSeconds    = 30
+	defaultHealthCheckTimeoutSeconds     = 5
+	defaultHealthCheckHealthyThreshold   = 2
+	defaultHealthCheckUnhealthyThreshold = 2
 )
+
+type HealthCheckConfig struct {
+	DefaultType               string
+	DefaultPath               string
+	DefaultIntervalSeconds    int32
+	DefaultTimeoutSeconds     int32
+	DefaultHealthyThreshold   int32
+	DefaultUnhealthyThreshold int32
+}
 
 type Config struct {
 	LogLevel             string
@@ -36,6 +53,8 @@ type Config struct {
 	MinInstanceCount int
 	// DeleteOrphanTargetGroups controls whether to delete target groups without corresponding services
 	DeleteOrphanTargetGroups bool
+	// HealthCheck contains default health check configuration
+	HealthCheck HealthCheckConfig
 }
 
 type configField struct {
@@ -105,6 +124,14 @@ func LoadConfigFromEnv() (Config, error) {
 		MatchingLabelValue:       defaultMatchingLabelValue,
 		MinInstanceCount:         defaultMinInstanceCount,
 		DeleteOrphanTargetGroups: defaultDeleteOrphanTargetGroups,
+		HealthCheck: HealthCheckConfig{
+			DefaultType:               defaultHealthCheckType,
+			DefaultPath:               defaultHealthCheckPath,
+			DefaultIntervalSeconds:    defaultHealthCheckIntervalSeconds,
+			DefaultTimeoutSeconds:     defaultHealthCheckTimeoutSeconds,
+			DefaultHealthyThreshold:   defaultHealthCheckHealthyThreshold,
+			DefaultUnhealthyThreshold: defaultHealthCheckUnhealthyThreshold,
+		},
 	}
 
 	pairs := []configField{

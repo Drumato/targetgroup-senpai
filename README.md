@@ -5,6 +5,7 @@ A Kubernetes controller that automatically manages AWS ELBv2 Target Groups for N
 ## Features
 
 - **Automatic Target Group Management**: Creates, updates, and deletes AWS Target Groups based on Kubernetes NodePort services
+- **Health Check Configuration**: Supports TCP, HTTP, and HTTPS health checks with customizable parameters via service annotations
 - **Label-based Service Discovery**: Uses Kubernetes labels to identify services that should be managed
 - **Smart Node Registration**: Handles both cluster-wide and local traffic policies (`ExternalTrafficPolicy`)
 - **Continuous Synchronization**: Monitors node health and automatically updates target registrations
@@ -234,6 +235,204 @@ When disabled, Target Groups will remain in AWS even after their corresponding s
 - Preventing accidental deletion of Target Groups
 - Maintaining Target Groups for services that are temporarily removed
 - Managing Target Group lifecycle manually
+
+## Health Check Configuration
+
+targetgroup-senpai supports configurable health checks for Target Groups using service annotations. By default, all Target Groups use TCP health checks, but you can configure HTTP or HTTPS health checks with custom parameters.
+
+### Health Check Types
+
+#### TCP Health Checks (Default)
+When no health check annotations are specified, targetgroup-senpai creates Target Groups with TCP health checks:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: my-app
+# No annotations = TCP health check on port 30080
+```
+
+#### HTTP Health Checks
+Configure HTTP health checks for services that expose HTTP endpoints:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-web-app
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/healthcheck-type: "http"
+    targetgroup-senpai.drumato.com/healthcheck-path: "/health"
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: my-web-app
+```
+
+#### HTTPS Health Checks
+Configure HTTPS health checks for secure services:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-secure-app
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/healthcheck-type: "https"
+    targetgroup-senpai.drumato.com/healthcheck-path: "/api/health"
+    targetgroup-senpai.drumato.com/healthcheck-port: "30443"
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: my-secure-app
+```
+
+### Health Check Annotations
+
+| Annotation | Description | Valid Values | Default |
+|------------|-------------|--------------|---------|
+| `targetgroup-senpai.drumato.com/healthcheck-type` | Health check protocol | `tcp`, `http`, `https` | `tcp` |
+| `targetgroup-senpai.drumato.com/healthcheck-path` | Health check path (HTTP/HTTPS only) | Any valid URL path starting with `/` | `/` |
+| `targetgroup-senpai.drumato.com/healthcheck-port` | Health check port | `1-65535` | Service NodePort |
+| `targetgroup-senpai.drumato.com/healthcheck-interval` | Interval between health checks (seconds) | `5-300` | `30` |
+| `targetgroup-senpai.drumato.com/healthcheck-timeout` | Health check timeout (seconds) | `2-120` | `5` |
+| `targetgroup-senpai.drumato.com/healthcheck-healthy-threshold` | Consecutive successful health checks to mark healthy | `2-10` | `2` |
+| `targetgroup-senpai.drumato.com/healthcheck-unhealthy-threshold` | Consecutive failed health checks to mark unhealthy | `2-10` | `2` |
+
+### Health Check Examples
+
+#### Basic HTTP Health Check
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/healthcheck-type: "http"
+    targetgroup-senpai.drumato.com/healthcheck-path: "/api/v1/health"
+spec:
+  type: NodePort
+  ports:
+  - port: 8080
+    nodePort: 30080
+  selector:
+    app: api-service
+```
+
+#### Custom Health Check Configuration
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: custom-service
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/healthcheck-type: "http"
+    targetgroup-senpai.drumato.com/healthcheck-path: "/healthz"
+    targetgroup-senpai.drumato.com/healthcheck-interval: "60"
+    targetgroup-senpai.drumato.com/healthcheck-timeout: "10"
+    targetgroup-senpai.drumato.com/healthcheck-healthy-threshold: "3"
+    targetgroup-senpai.drumato.com/healthcheck-unhealthy-threshold: "5"
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: custom-service
+```
+
+#### HTTPS Health Check with Custom Port
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-api
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/healthcheck-type: "https"
+    targetgroup-senpai.drumato.com/healthcheck-path: "/health"
+    targetgroup-senpai.drumato.com/healthcheck-port: "30443"
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  - port: 443
+    nodePort: 30443
+  selector:
+    app: secure-api
+```
+
+### Health Check Validation
+
+targetgroup-senpai validates health check configurations and will reject invalid settings:
+
+- **Type validation**: Only `tcp`, `http`, and `https` are supported
+- **Path validation**: HTTP/HTTPS health checks require a valid path; TCP health checks cannot specify a path
+- **Port validation**: Must be between 1 and 65535
+- **Timing validation**: Timeout must be less than interval
+- **Range validation**: All numeric values must be within AWS ELBv2 limits
+- **Dependency validation**: HTTP/HTTPS health checks require a path (defaults to `/`)
+
+### Health Check Troubleshooting
+
+#### Common Issues
+
+**Invalid health check type**
+```
+Error: invalid health check type 'tcp-custom', must be one of: tcp, http, https
+```
+Solution: Use only supported health check types.
+
+**Path specified for TCP health check**
+```
+Error: health check path is not valid for TCP health checks
+```
+Solution: Remove the `healthcheck-path` annotation for TCP health checks.
+
+**Timeout greater than interval**
+```
+Error: health check timeout (15) must be less than interval (10)
+```
+Solution: Ensure timeout is less than interval.
+
+#### Health Check Monitoring
+
+Monitor health check configuration in the controller logs:
+
+```bash
+kubectl logs -n targetgroup-senpai deployment/targetgroup-senpai -f
+```
+
+Look for log entries showing health check configuration:
+```
+INFO Creating target group name=tgs-default-my-app service=default/my-app nodePort=30080 healthCheckType=http healthCheckPort=30080 healthCheckPath=/health
+```
 
 ## Target Group Naming
 
