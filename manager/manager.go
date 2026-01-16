@@ -308,7 +308,8 @@ func (m *Manager) updateTargetGroupTargets(ctx context.Context, targetGroupArn s
 			return types.TargetDescription{}, false
 		}
 		return types.TargetDescription{
-			Id: aws.String(nodeIP),
+			Id:               aws.String(nodeIP),
+			AvailabilityZone: aws.String("all"),
 		}, true
 	})
 
