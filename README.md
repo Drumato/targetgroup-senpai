@@ -10,6 +10,7 @@ A Kubernetes controller that automatically manages AWS ELBv2 Target Groups for N
 - **Smart Node Registration**: Handles both cluster-wide and local traffic policies (`ExternalTrafficPolicy`)
 - **Continuous Synchronization**: Monitors node health and automatically updates target registrations
 - **Orphan Cleanup**: Removes Target Groups when corresponding Kubernetes services are deleted
+- **Multi-Cluster Support**: Cluster isolation with tagging to prevent cross-cluster interference
 - **Dry Run Mode**: Test configurations without making actual AWS changes
 - **Configurable Logging**: Structured logging with multiple levels (debug, info, warn, error)
 - **Secure Deployment**: Runs with non-root user in distroless container
@@ -137,6 +138,7 @@ targetgroup-senpai is configured via environment variables:
 | `CLIENT_TIMEOUT_SECONDS` | Timeout for Kubernetes/AWS API calls | `10` | No |
 | `MIN_INSTANCE_COUNT` | Minimum nodes required for Target Group creation | `3` | No |
 | `DELETE_ORPHAN_TARGET_GROUPS` | Enable deletion of orphaned Target Groups | `true` | No |
+| `CLUSTER_NAME` | Cluster identifier for multi-cluster isolation | - | No |
 
 ### AWS Configuration
 
@@ -235,6 +237,35 @@ When disabled, Target Groups will remain in AWS even after their corresponding s
 - Preventing accidental deletion of Target Groups
 - Maintaining Target Groups for services that are temporarily removed
 - Managing Target Group lifecycle manually
+
+## Multi-Cluster Support
+
+targetgroup-senpai supports multi-cluster environments through cluster isolation:
+
+- **Cluster Tagging**: When `CLUSTER_NAME` is set, all created Target Groups are tagged with the cluster name
+- **Isolated Cleanup**: Only manages Target Groups belonging to the same cluster during orphan cleanup
+- **Backward Compatibility**: Existing Target Groups without cluster tags are preserved when `CLUSTER_NAME` is introduced
+- **Gradual Migration**: Can be deployed incrementally across clusters without affecting existing deployments
+
+### Configuration Example
+
+```yaml
+env:
+- name: CLUSTER_NAME
+  value: "production-cluster-1"
+```
+
+### Behavior
+
+- Target Groups created with `CLUSTER_NAME=production-cluster-1` will only be cleaned up by instances with the same cluster name
+- Target Groups from other clusters or without cluster tags will be ignored during cleanup
+- This prevents accidental deletion of Target Groups managed by other cluster instances
+
+### Migration Strategy
+
+1. **Phase 1**: Deploy targetgroup-senpai without `CLUSTER_NAME` (existing behavior)
+2. **Phase 2**: Add `CLUSTER_NAME` to configuration - new Target Groups will be tagged, existing ones preserved
+3. **Phase 3**: Redeploy services to get cluster tags on all Target Groups
 
 ## Health Check Configuration
 

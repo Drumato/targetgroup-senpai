@@ -20,6 +20,10 @@ import (
 const (
 	// TagKeyDeleteKey is the key for the tag that indicates which service this target group belongs to
 	TagKeyDeleteKey = "targetgroup-senpai-delete-key"
+	// TagKeyClusterName is the key for the tag that indicates which cluster this target group belongs to
+	TagKeyClusterName = "targetgroup-senpai-cluster-name"
+	// TagKeyName is the key for the Name tag
+	TagKeyName = "Name"
 
 	// Health Check Annotation Keys
 	AnnotationHealthCheckType               = "targetgroup-senpai.drumato.com/healthcheck-type"
@@ -297,6 +301,26 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		healthCheckProtocol = types.ProtocolEnumTcp
 	}
 
+	// Build tags dynamically
+	tags := []types.Tag{
+		{
+			Key:   aws.String(TagKeyDeleteKey),
+			Value: aws.String(serviceKey),
+		},
+		{
+			Key:   aws.String(TagKeyName),
+			Value: aws.String(targetGroupName),
+		},
+	}
+
+	// ClusterNameが設定されている場合はクラスタータグを追加
+	if m.cfg.ClusterName != "" {
+		tags = append(tags, types.Tag{
+			Key:   aws.String(TagKeyClusterName),
+			Value: aws.String(m.cfg.ClusterName),
+		})
+	}
+
 	// Create target group with health check configuration
 	createInput := &elasticloadbalancingv2.CreateTargetGroupInput{
 		Name:                       aws.String(targetGroupName),
@@ -310,12 +334,7 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		HealthCheckTimeoutSeconds:  aws.Int32(healthCheckConfig.TimeoutSeconds),
 		HealthyThresholdCount:      aws.Int32(healthCheckConfig.HealthyThreshold),
 		UnhealthyThresholdCount:    aws.Int32(healthCheckConfig.UnhealthyThreshold),
-		Tags: []types.Tag{
-			{
-				Key:   aws.String(TagKeyDeleteKey),
-				Value: aws.String(serviceKey),
-			},
-		},
+		Tags:                       tags,
 	}
 
 	// Add health check path for HTTP/HTTPS protocols
@@ -323,13 +342,20 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		createInput.HealthCheckPath = aws.String(healthCheckConfig.Path)
 	}
 
-	m.logger.InfoContext(ctx, "Creating target group",
+	logFields := []any{
 		"name", targetGroupName,
 		"service", serviceKey,
 		"nodePort", nodePort,
 		"healthCheckType", healthCheckConfig.Type,
 		"healthCheckPort", healthCheckConfig.Port,
-		"healthCheckPath", healthCheckConfig.Path)
+		"healthCheckPath", healthCheckConfig.Path,
+	}
+
+	if m.cfg.ClusterName != "" {
+		logFields = append(logFields, "clusterName", m.cfg.ClusterName)
+	}
+
+	m.logger.InfoContext(ctx, "Creating target group", logFields...)
 
 	if m.cfg.DryRun {
 		m.logger.InfoContext(ctx, "DRY RUN: Would create target group", "input", createInput)
@@ -519,6 +545,27 @@ func (m *Manager) cleanupOrphanedTargetGroups(ctx context.Context) error {
 			continue
 		}
 
+		// CLUSTER_NAMEが設定されている場合のクラスター名マッチング
+		if m.cfg.ClusterName != "" {
+			clusterNameFromTags := m.getClusterNameFromTags(tags)
+			// 以下の条件でスキップ:
+			// - タグにクラスター名があり、現在のクラスター名と異なる場合
+			if clusterNameFromTags != "" && clusterNameFromTags != m.cfg.ClusterName {
+				m.logger.DebugContext(ctx, "Skipping target group from different cluster",
+					"arn", *tg.TargetGroupArn,
+					"tagClusterName", clusterNameFromTags,
+					"currentClusterName", m.cfg.ClusterName)
+				continue
+			}
+			// クラスター名タグがない場合は削除対象から除外（後方互換性）
+			if clusterNameFromTags == "" {
+				m.logger.DebugContext(ctx, "Skipping target group without cluster tag (backward compatibility)",
+					"arn", *tg.TargetGroupArn,
+					"service", serviceKey)
+				continue
+			}
+		}
+
 		if !existingServiceKeys[serviceKey] {
 			// Service no longer exists, delete target group
 			if err := m.deleteTargetGroup(ctx, *tg.TargetGroupArn, serviceKey); err != nil {
@@ -547,6 +594,16 @@ func (m *Manager) hasDeleteKeyTag(tags []types.Tag) bool {
 func (m *Manager) getDeleteKeyFromTags(tags []types.Tag) string {
 	for _, tag := range tags {
 		if tag.Key != nil && *tag.Key == TagKeyDeleteKey && tag.Value != nil {
+			return *tag.Value
+		}
+	}
+	return ""
+}
+
+// getClusterNameFromTags extracts the cluster name value from target group tags
+func (m *Manager) getClusterNameFromTags(tags []types.Tag) string {
+	for _, tag := range tags {
+		if tag.Key != nil && *tag.Key == TagKeyClusterName && tag.Value != nil {
 			return *tag.Value
 		}
 	}

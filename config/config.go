@@ -49,6 +49,8 @@ type Config struct {
 	MatchingLabelValue string
 	// VpcId is the VPC ID where target groups will be created
 	VpcId string
+	// ClusterName is the name of the cluster this instance is running in
+	ClusterName string
 	// MinInstanceCount is the minimum number of instances required for target group operations
 	MinInstanceCount int
 	// DeleteOrphanTargetGroups controls whether to delete target groups without corresponding services
@@ -144,6 +146,7 @@ func LoadConfigFromEnv() (Config, error) {
 		{"MIN_INSTANCE_COUNT", &cfg.MinInstanceCount, defaultMinInstanceCount, true},
 		{"DELETE_ORPHAN_TARGET_GROUPS", &cfg.DeleteOrphanTargetGroups, defaultDeleteOrphanTargetGroups, true},
 		{"VPC_ID", &cfg.VpcId, "", false},
+		{"CLUSTER_NAME", &cfg.ClusterName, "", true},
 	}
 
 	if err := lo.Reduce(pairs, loadConfigFieldFromEnv, nil); err != nil {
