@@ -11,6 +11,7 @@ A Kubernetes controller that automatically manages AWS ELBv2 Target Groups for N
 - **Continuous Synchronization**: Monitors node health and automatically updates target registrations
 - **Orphan Cleanup**: Removes Target Groups when corresponding Kubernetes services are deleted
 - **Multi-Cluster Support**: Cluster isolation with tagging to prevent cross-cluster interference
+- **Proxy Protocol v2 Support**: Automatic management of Proxy Protocol v2 settings for Target Groups
 - **Dry Run Mode**: Test configurations without making actual AWS changes
 - **Configurable Logging**: Structured logging with multiple levels (debug, info, warn, error)
 - **Secure Deployment**: Runs with non-root user in distroless container
@@ -56,6 +57,8 @@ The service account or EC2 instance role needs the following permissions:
         "elasticloadbalancing:DescribeTargetGroups",
         "elasticloadbalancing:DescribeTags",
         "elasticloadbalancing:ModifyTargetGroup",
+        "elasticloadbalancing:ModifyTargetGroupAttributes",
+        "elasticloadbalancing:DescribeTargetGroupAttributes",
         "elasticloadbalancing:RegisterTargets",
         "elasticloadbalancing:DeregisterTargets"
       ],
@@ -464,6 +467,143 @@ Look for log entries showing health check configuration:
 ```
 INFO Creating target group name=tgs-default-my-app service=default/my-app nodePort=30080 healthCheckType=http healthCheckPort=30080 healthCheckPath=/health
 ```
+
+## Proxy Protocol v2 Support
+
+targetgroup-senpai automatically manages Proxy Protocol v2 settings for Target Groups. By default, Proxy Protocol v2 is enabled for all Target Groups, but can be disabled per service using annotations.
+
+### Default Behavior
+
+All Target Groups created by targetgroup-senpai have Proxy Protocol v2 enabled by default. This allows load balancers to preserve client connection information when forwarding requests to targets.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: my-app
+# No annotations = Proxy Protocol v2 enabled (default)
+```
+
+### Disabling Proxy Protocol v2
+
+To disable Proxy Protocol v2 for a specific service, use the disable annotation:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-legacy-app
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/disable-proxy-protocol-v2: "true"
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: my-legacy-app
+```
+
+### Proxy Protocol v2 Annotations
+
+| Annotation | Description | Valid Values | Default |
+|------------|-------------|--------------|---------|
+| `targetgroup-senpai.drumato.com/disable-proxy-protocol-v2` | Disable Proxy Protocol v2 for the Target Group | `true`, `false` | `false` (enabled) |
+
+### Proxy Protocol v2 Configuration Examples
+
+#### Service with Proxy Protocol v2 Enabled (Default)
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: web-service
+# Proxy Protocol v2 is enabled by default
+```
+
+#### Service with Proxy Protocol v2 Explicitly Disabled
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-service
+  labels:
+    app.kubernetes.io/managed-by: targetgroup-senpai
+  annotations:
+    targetgroup-senpai.drumato.com/disable-proxy-protocol-v2: "true"
+spec:
+  type: NodePort
+  ports:
+  - port: 8080
+    nodePort: 30080
+  selector:
+    app: legacy-service
+```
+
+### Proxy Protocol v2 Updates
+
+When service annotations are modified, targetgroup-senpai automatically updates the Target Group's Proxy Protocol v2 setting to match the desired state:
+
+- If a service starts with Proxy Protocol v2 enabled and the disable annotation is added, it will be disabled
+- If a service has Proxy Protocol v2 disabled and the disable annotation is removed, it will be enabled
+- Changes are applied during the next reconciliation cycle
+
+### Proxy Protocol v2 Troubleshooting
+
+#### Common Issues
+
+**Application not receiving client IP information**
+If your application expects to receive original client IP information but isn't getting it:
+1. Ensure your application supports Proxy Protocol v2
+2. Verify that Proxy Protocol v2 is enabled (default behavior)
+3. Check that your load balancer is configured to send Proxy Protocol v2 headers
+
+**Legacy applications failing with Proxy Protocol v2**
+If older applications that don't understand Proxy Protocol v2 are receiving malformed requests:
+1. Add the disable annotation: `targetgroup-senpai.drumato.com/disable-proxy-protocol-v2: "true"`
+2. Redeploy or wait for the next reconciliation cycle
+3. Verify the Target Group attribute in AWS console
+
+#### Proxy Protocol v2 Monitoring
+
+Monitor Proxy Protocol v2 configuration in the controller logs:
+
+```bash
+kubectl logs -n targetgroup-senpai deployment/targetgroup-senpai -f
+```
+
+Look for log entries showing Proxy Protocol v2 configuration:
+```
+INFO Modified target group proxy protocol v2 attribute targetGroupArn=arn:aws:elasticloadbalancing:... enabled=true
+INFO Modified target group proxy protocol v2 attribute targetGroupArn=arn:aws:elasticloadbalancing:... enabled=false
+```
+
+### Best Practices
+
+1. **Default to Enabled**: Keep Proxy Protocol v2 enabled unless you have specific legacy applications that cannot handle it
+2. **Gradual Migration**: When migrating legacy applications, test with Proxy Protocol v2 disabled first, then enable once the application is updated
+3. **Monitor Application Logs**: After enabling Proxy Protocol v2, monitor application logs for any parsing errors or connection issues
+4. **Load Balancer Configuration**: Ensure your load balancer (ALB/NLB) is configured to send Proxy Protocol v2 headers when forwarding requests
 
 ## Target Group Naming
 

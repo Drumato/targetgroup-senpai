@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -57,6 +58,16 @@ func (m *MockELBv2Client) DeregisterTargets(ctx context.Context, params *elastic
 func (m *MockELBv2Client) DeleteTargetGroup(ctx context.Context, params *elasticloadbalancingv2.DeleteTargetGroupInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DeleteTargetGroupOutput, error) {
 	args := m.Called(ctx, params)
 	return args.Get(0).(*elasticloadbalancingv2.DeleteTargetGroupOutput), args.Error(1)
+}
+
+func (m *MockELBv2Client) ModifyTargetGroupAttributes(ctx context.Context, params *elasticloadbalancingv2.ModifyTargetGroupAttributesInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.ModifyTargetGroupAttributesOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*elasticloadbalancingv2.ModifyTargetGroupAttributesOutput), args.Error(1)
+}
+
+func (m *MockELBv2Client) DescribeTargetGroupAttributes(ctx context.Context, params *elasticloadbalancingv2.DescribeTargetGroupAttributesInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DescribeTargetGroupAttributesOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*elasticloadbalancingv2.DescribeTargetGroupAttributesOutput), args.Error(1)
 }
 
 func TestFilterNodePortServices(t *testing.T) {
@@ -764,6 +775,18 @@ func TestEnsureTargetGroupForService(t *testing.T) {
 							},
 						}, nil)
 
+					// Mock DescribeTargetGroupAttributes for existing target group proxy protocol v2 check
+					mockELB.On("DescribeTargetGroupAttributes", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.DescribeTargetGroupAttributesInput")).
+						Return(&elasticloadbalancingv2.DescribeTargetGroupAttributesOutput{
+							Attributes: []types.TargetGroupAttribute{
+								{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("false")}, // Assume it's currently disabled
+							},
+						}, nil)
+
+					// Mock ModifyTargetGroupAttributes for proxy protocol v2 setting update
+					mockELB.On("ModifyTargetGroupAttributes", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.ModifyTargetGroupAttributesInput")).
+						Return(&elasticloadbalancingv2.ModifyTargetGroupAttributesOutput{}, nil)
+
 					// Mock RegisterTargets for update
 					mockELB.On("RegisterTargets", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.RegisterTargetsInput")).
 						Return(&elasticloadbalancingv2.RegisterTargetsOutput{}, nil)
@@ -779,6 +802,10 @@ func TestEnsureTargetGroupForService(t *testing.T) {
 									{TargetGroupArn: aws.String("arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/test/1234567890123456")},
 								},
 							}, nil)
+
+						// Mock ModifyTargetGroupAttributes for proxy protocol v2 setting
+						mockELB.On("ModifyTargetGroupAttributes", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.ModifyTargetGroupAttributesInput")).
+							Return(&elasticloadbalancingv2.ModifyTargetGroupAttributesOutput{}, nil)
 
 						// Mock RegisterTargets for new target group
 						mockELB.On("RegisterTargets", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.RegisterTargetsInput")).
@@ -1612,6 +1639,10 @@ func TestEnsureTargetGroupForServiceWithHealthCheck(t *testing.T) {
 					},
 				}, nil)
 
+				// Mock ModifyTargetGroupAttributes for proxy protocol v2 setting
+				mockELB.On("ModifyTargetGroupAttributes", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.ModifyTargetGroupAttributesInput")).
+					Return(&elasticloadbalancingv2.ModifyTargetGroupAttributesOutput{}, nil)
+
 				// Mock RegisterTargets
 				mockELB.On("RegisterTargets", mock.Anything, mock.AnythingOfType("*elasticloadbalancingv2.RegisterTargetsInput")).
 					Return(&elasticloadbalancingv2.RegisterTargetsOutput{}, nil)
@@ -1623,6 +1654,294 @@ func TestEnsureTargetGroupForServiceWithHealthCheck(t *testing.T) {
 			if tt.expectCreate {
 				mockELB.AssertExpectations(t)
 			}
+		})
+	}
+}
+
+func TestShouldEnableProxyProtocolV2(t *testing.T) {
+	tests := []struct {
+		name        string
+		service     corev1.Service
+		expected    bool
+		description string
+	}{
+		{
+			name: "enables proxy protocol v2 by default when no annotations",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-service",
+					Namespace: "default",
+				},
+			},
+			expected:    true,
+			description: "should enable proxy protocol v2 when no annotations are present",
+		},
+		{
+			name: "enables proxy protocol v2 when annotation is empty",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-service",
+					Namespace:   "default",
+					Annotations: map[string]string{},
+				},
+			},
+			expected:    true,
+			description: "should enable proxy protocol v2 when annotations map is empty",
+		},
+		{
+			name: "disables proxy protocol v2 when annotation is true",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-service",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationDisableProxyProtocolV2: "true",
+					},
+				},
+			},
+			expected:    false,
+			description: "should disable proxy protocol v2 when disable annotation is 'true'",
+		},
+		{
+			name: "disables proxy protocol v2 when annotation is TRUE (case insensitive)",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-service",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationDisableProxyProtocolV2: "TRUE",
+					},
+				},
+			},
+			expected:    false,
+			description: "should disable proxy protocol v2 when disable annotation is 'TRUE' (case insensitive)",
+		},
+		{
+			name: "enables proxy protocol v2 when annotation is false",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-service",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationDisableProxyProtocolV2: "false",
+					},
+				},
+			},
+			expected:    true,
+			description: "should enable proxy protocol v2 when disable annotation is 'false'",
+		},
+		{
+			name: "enables proxy protocol v2 when annotation value is invalid",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-service",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationDisableProxyProtocolV2: "invalid",
+					},
+				},
+			},
+			expected:    true,
+			description: "should enable proxy protocol v2 when disable annotation has invalid value",
+		},
+		{
+			name: "handles whitespace in annotation value",
+			service: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-service",
+					Namespace: "default",
+					Annotations: map[string]string{
+						AnnotationDisableProxyProtocolV2: "  true  ",
+					},
+				},
+			},
+			expected:    false,
+			description: "should handle whitespace correctly in annotation value",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewManager(config.Config{}, fake.NewClientBuilder().Build(), &MockELBv2Client{}, slog.Default())
+			result := manager.shouldEnableProxyProtocolV2(tt.service)
+			assert.Equal(t, tt.expected, result, tt.description)
+		})
+	}
+}
+
+func TestModifyTargetGroupProxyProtocolV2(t *testing.T) {
+	tests := []struct {
+		name          string
+		enable        bool
+		dryRun        bool
+		expectAPICall bool
+		expectError   bool
+		mockError     error
+		description   string
+	}{
+		{
+			name:          "enables proxy protocol v2 successfully",
+			enable:        true,
+			dryRun:        false,
+			expectAPICall: true,
+			expectError:   false,
+			description:   "should successfully enable proxy protocol v2",
+		},
+		{
+			name:          "disables proxy protocol v2 successfully",
+			enable:        false,
+			dryRun:        false,
+			expectAPICall: true,
+			expectError:   false,
+			description:   "should successfully disable proxy protocol v2",
+		},
+		{
+			name:          "dry run mode - enable",
+			enable:        true,
+			dryRun:        true,
+			expectAPICall: false,
+			expectError:   false,
+			description:   "should not make API call in dry run mode",
+		},
+		{
+			name:          "dry run mode - disable",
+			enable:        false,
+			dryRun:        true,
+			expectAPICall: false,
+			expectError:   false,
+			description:   "should not make API call in dry run mode",
+		},
+		{
+			name:          "handles API error",
+			enable:        true,
+			dryRun:        false,
+			expectAPICall: true,
+			expectError:   true,
+			mockError:     fmt.Errorf("API error"),
+			description:   "should handle API errors correctly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{DryRun: tt.dryRun}
+			mockELB := &MockELBv2Client{}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			manager := NewManager(cfg, fake.NewClientBuilder().Build(), mockELB, logger)
+
+			targetGroupArn := "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/test/1234567890123456"
+
+			if tt.expectAPICall {
+				expectedValue := "false"
+				if tt.enable {
+					expectedValue = "true"
+				}
+
+				mockELB.On("ModifyTargetGroupAttributes", mock.Anything, mock.MatchedBy(func(input *elasticloadbalancingv2.ModifyTargetGroupAttributesInput) bool {
+					if input.TargetGroupArn == nil || *input.TargetGroupArn != targetGroupArn {
+						return false
+					}
+					if len(input.Attributes) != 1 {
+						return false
+					}
+					attr := input.Attributes[0]
+					return attr.Key != nil && *attr.Key == "proxy_protocol_v2.enabled" &&
+						attr.Value != nil && *attr.Value == expectedValue
+				})).Return(&elasticloadbalancingv2.ModifyTargetGroupAttributesOutput{}, tt.mockError)
+			}
+
+			err := manager.modifyTargetGroupProxyProtocolV2(context.Background(), targetGroupArn, tt.enable)
+
+			if tt.expectError {
+				assert.Error(t, err, tt.description)
+			} else {
+				assert.NoError(t, err, tt.description)
+			}
+
+			if tt.expectAPICall {
+				mockELB.AssertExpectations(t)
+			}
+		})
+	}
+}
+
+func TestGetCurrentProxyProtocolV2Setting(t *testing.T) {
+	tests := []struct {
+		name           string
+		attributes     []types.TargetGroupAttribute
+		expectedResult bool
+		expectError    bool
+		mockError      error
+		description    string
+	}{
+		{
+			name: "returns true when proxy protocol v2 is enabled",
+			attributes: []types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("true")},
+			},
+			expectedResult: true,
+			expectError:    false,
+			description:    "should return true when proxy protocol v2 is enabled",
+		},
+		{
+			name: "returns false when proxy protocol v2 is disabled",
+			attributes: []types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("false")},
+			},
+			expectedResult: false,
+			expectError:    false,
+			description:    "should return false when proxy protocol v2 is disabled",
+		},
+		{
+			name: "returns false when proxy protocol v2 attribute is not present",
+			attributes: []types.TargetGroupAttribute{
+				{Key: aws.String("some_other_attribute"), Value: aws.String("value")},
+			},
+			expectedResult: false,
+			expectError:    false,
+			description:    "should return false when proxy protocol v2 attribute is not present",
+		},
+		{
+			name:           "returns false when no attributes",
+			attributes:     []types.TargetGroupAttribute{},
+			expectedResult: false,
+			expectError:    false,
+			description:    "should return false when no attributes are present",
+		},
+		{
+			name:           "handles API error",
+			attributes:     []types.TargetGroupAttribute{},
+			expectedResult: false,
+			expectError:    true,
+			mockError:      fmt.Errorf("API error"),
+			description:    "should handle API errors correctly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockELB := &MockELBv2Client{}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			manager := NewManager(config.Config{}, fake.NewClientBuilder().Build(), mockELB, logger)
+
+			targetGroupArn := "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/test/1234567890123456"
+
+			mockELB.On("DescribeTargetGroupAttributes", mock.Anything, mock.MatchedBy(func(input *elasticloadbalancingv2.DescribeTargetGroupAttributesInput) bool {
+				return input.TargetGroupArn != nil && *input.TargetGroupArn == targetGroupArn
+			})).Return(&elasticloadbalancingv2.DescribeTargetGroupAttributesOutput{
+				Attributes: tt.attributes,
+			}, tt.mockError)
+
+			result, err := manager.getCurrentProxyProtocolV2Setting(context.Background(), targetGroupArn)
+
+			if tt.expectError {
+				assert.Error(t, err, tt.description)
+			} else {
+				assert.NoError(t, err, tt.description)
+				assert.Equal(t, tt.expectedResult, result, tt.description)
+			}
+
+			mockELB.AssertExpectations(t)
 		})
 	}
 }

@@ -33,6 +33,9 @@ const (
 	AnnotationHealthCheckTimeout            = "targetgroup-senpai.drumato.com/healthcheck-timeout"
 	AnnotationHealthCheckHealthyThreshold   = "targetgroup-senpai.drumato.com/healthcheck-healthy-threshold"
 	AnnotationHealthCheckUnhealthyThreshold = "targetgroup-senpai.drumato.com/healthcheck-unhealthy-threshold"
+
+	// Proxy Protocol Annotation Keys
+	AnnotationDisableProxyProtocolV2 = "targetgroup-senpai.drumato.com/disable-proxy-protocol-v2"
 )
 
 // ELBv2Client defines the interface for ELBv2 operations needed by the manager
@@ -44,6 +47,8 @@ type ELBv2Client interface {
 	RegisterTargets(ctx context.Context, params *elasticloadbalancingv2.RegisterTargetsInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.RegisterTargetsOutput, error)
 	DeregisterTargets(ctx context.Context, params *elasticloadbalancingv2.DeregisterTargetsInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DeregisterTargetsOutput, error)
 	DeleteTargetGroup(ctx context.Context, params *elasticloadbalancingv2.DeleteTargetGroupInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DeleteTargetGroupOutput, error)
+	ModifyTargetGroupAttributes(ctx context.Context, params *elasticloadbalancingv2.ModifyTargetGroupAttributesInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.ModifyTargetGroupAttributesOutput, error)
+	DescribeTargetGroupAttributes(ctx context.Context, params *elasticloadbalancingv2.DescribeTargetGroupAttributesInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DescribeTargetGroupAttributesOutput, error)
 }
 
 // ServiceHealthCheckConfig holds the parsed health check configuration for a service
@@ -369,8 +374,23 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 
 	describeOutput, err := m.elbv2Client.DescribeTargetGroups(ctx, describeInput)
 	if err == nil && len(describeOutput.TargetGroups) > 0 {
-		// Target group exists, update targets
+		// Target group exists, update targets and proxy protocol v2 setting
 		targetGroupArn := *describeOutput.TargetGroups[0].TargetGroupArn
+
+		// Check and update proxy protocol v2 setting if needed
+		desiredProxyProtocolV2 := m.shouldEnableProxyProtocolV2(svc)
+		currentProxyProtocolV2, err := m.getCurrentProxyProtocolV2Setting(ctx, targetGroupArn)
+		if err != nil {
+			m.logger.ErrorContext(ctx, "Failed to get current proxy protocol v2 setting",
+				"targetGroupArn", targetGroupArn, "error", err)
+		} else if currentProxyProtocolV2 != desiredProxyProtocolV2 {
+			// Update proxy protocol v2 setting
+			if err := m.modifyTargetGroupProxyProtocolV2(ctx, targetGroupArn, desiredProxyProtocolV2); err != nil {
+				m.logger.ErrorContext(ctx, "Failed to update proxy protocol v2 setting",
+					"targetGroupArn", targetGroupArn, "error", err)
+			}
+		}
+
 		return m.updateTargetGroupTargets(ctx, targetGroupArn, targetNodes)
 	}
 
@@ -382,6 +402,14 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 
 	targetGroupArn := *createOutput.TargetGroups[0].TargetGroupArn
 	m.logger.InfoContext(ctx, "Created target group", "arn", targetGroupArn, "service", serviceKey)
+
+	// Set proxy protocol v2 attribute for new target group
+	enableProxyProtocolV2 := m.shouldEnableProxyProtocolV2(svc)
+	if err := m.modifyTargetGroupProxyProtocolV2(ctx, targetGroupArn, enableProxyProtocolV2); err != nil {
+		m.logger.ErrorContext(ctx, "Failed to set proxy protocol v2 for new target group",
+			"targetGroupArn", targetGroupArn, "error", err)
+		// Continue with target registration even if proxy protocol v2 setting fails
+	}
 
 	// Register targets
 	return m.updateTargetGroupTargets(ctx, targetGroupArn, targetNodes)
@@ -772,4 +800,80 @@ func (m *Manager) parseHealthCheckConfig(svc corev1.Service, servicePort int32) 
 	}
 
 	return config, nil
+}
+
+// shouldEnableProxyProtocolV2 determines if proxy protocol v2 should be enabled for a service
+// Returns true by default, unless the disable annotation is explicitly set to "true"
+func (m *Manager) shouldEnableProxyProtocolV2(svc corev1.Service) bool {
+	if svc.Annotations == nil {
+		return true // Default: enable proxy protocol v2
+	}
+
+	// Check for disable annotation
+	if disableAnnotation, exists := svc.Annotations[AnnotationDisableProxyProtocolV2]; exists {
+		disableAnnotation = strings.ToLower(strings.TrimSpace(disableAnnotation))
+		return disableAnnotation != "true"
+	}
+
+	return true // Default: enable proxy protocol v2
+}
+
+// modifyTargetGroupProxyProtocolV2 sets the proxy protocol v2 attribute for a target group
+func (m *Manager) modifyTargetGroupProxyProtocolV2(ctx context.Context, targetGroupArn string, enable bool) error {
+	enableStr := "false"
+	if enable {
+		enableStr = "true"
+	}
+
+	modifyInput := &elasticloadbalancingv2.ModifyTargetGroupAttributesInput{
+		TargetGroupArn: aws.String(targetGroupArn),
+		Attributes: []types.TargetGroupAttribute{
+			{
+				Key:   aws.String("proxy_protocol_v2.enabled"),
+				Value: aws.String(enableStr),
+			},
+		},
+	}
+
+	if m.cfg.DryRun {
+		m.logger.InfoContext(ctx, "DRY RUN: Would modify target group proxy protocol v2",
+			"targetGroupArn", targetGroupArn,
+			"enable", enable)
+		return nil
+	}
+
+	_, err := m.elbv2Client.ModifyTargetGroupAttributes(ctx, modifyInput)
+	if err != nil {
+		return fmt.Errorf("failed to modify target group proxy protocol v2 attribute: %w", err)
+	}
+
+	m.logger.InfoContext(ctx, "Modified target group proxy protocol v2 attribute",
+		"targetGroupArn", targetGroupArn,
+		"enabled", enable)
+
+	return nil
+}
+
+// getCurrentProxyProtocolV2Setting gets the current proxy protocol v2 setting for a target group
+func (m *Manager) getCurrentProxyProtocolV2Setting(ctx context.Context, targetGroupArn string) (bool, error) {
+	describeInput := &elasticloadbalancingv2.DescribeTargetGroupAttributesInput{
+		TargetGroupArn: aws.String(targetGroupArn),
+	}
+
+	output, err := m.elbv2Client.DescribeTargetGroupAttributes(ctx, describeInput)
+	if err != nil {
+		return false, fmt.Errorf("failed to describe target group attributes: %w", err)
+	}
+
+	// Find the proxy protocol v2 attribute
+	for _, attr := range output.Attributes {
+		if attr.Key != nil && *attr.Key == "proxy_protocol_v2.enabled" {
+			if attr.Value != nil {
+				return *attr.Value == "true", nil
+			}
+		}
+	}
+
+	// Default is false if the attribute is not found
+	return false, nil
 }
