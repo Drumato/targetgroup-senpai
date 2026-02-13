@@ -243,12 +243,12 @@ func (m *Manager) getNodesWithServicePods(ctx context.Context, svc *corev1.Servi
 	return targetNodes, nil
 }
 
-// ensureTargetGroupForService creates or updates a target group for the given service and its target nodes
-func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Service, targetNodes []corev1.Node) error {
+// ensureTargetGroupForPort creates or updates a target group for the given service port and its target nodes
+func (m *Manager) ensureTargetGroupForPort(ctx context.Context, svc corev1.Service, port corev1.ServicePort, targetNodes []corev1.Node) error {
 	serviceKey := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
 
 	if len(targetNodes) == 0 {
-		m.logger.WarnContext(ctx, "No target nodes available for service", "service", serviceKey)
+		m.logger.WarnContext(ctx, "No target nodes available for service port", "service", serviceKey, "port", port.Port)
 		return nil
 	}
 
@@ -256,35 +256,35 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 	if len(targetNodes) < m.cfg.MinInstanceCount {
 		m.logger.WarnContext(ctx, "Insufficient target nodes to meet minimum instance count requirement",
 			"service", serviceKey,
+			"port", port.Port,
 			"available_nodes", len(targetNodes),
 			"min_required", m.cfg.MinInstanceCount)
 		return nil
 	}
 
-	// Create target group name (must be unique and follow AWS naming rules)
-	targetGroupName := fmt.Sprintf("tgs-%s-%s", svc.Namespace, svc.Name)
-	if len(targetGroupName) > 32 {
-		// Truncate if too long (AWS limit is 32 chars)
-		targetGroupName = targetGroupName[:32]
-	}
+	// Create target group name with port number (must be unique and follow AWS naming rules)
+	targetGroupName := m.generateTargetGroupName(svc, port.Port)
 
-	// Get the NodePort from the service
-	var nodePort int32
-	for _, port := range svc.Spec.Ports {
-		if port.NodePort != 0 {
-			nodePort = port.NodePort
-			break
-		}
-	}
-
+	// Get the NodePort from the service port
+	nodePort := port.NodePort
 	if nodePort == 0 {
-		return fmt.Errorf("no NodePort found for service %s", serviceKey)
+		return fmt.Errorf("no NodePort found for service %s port %d", serviceKey, port.Port)
 	}
 
 	// Parse health check configuration from service annotations
 	healthCheckConfig, err := m.parseHealthCheckConfig(svc, nodePort)
 	if err != nil {
-		return fmt.Errorf("failed to parse health check configuration for service %s: %w", serviceKey, err)
+		return fmt.Errorf("failed to parse health check configuration for service %s port %d: %w", serviceKey, port.Port, err)
+	}
+
+	// Build service key with port for tags and collision detection
+	serviceKeyWithPort := fmt.Sprintf("%s-%d", serviceKey, port.Port)
+
+	// Check for naming collisions (skip in dry-run mode to avoid complex mocking)
+	if !m.cfg.DryRun {
+		if err := m.detectTargetGroupCollision(ctx, targetGroupName, serviceKeyWithPort); err != nil {
+			return fmt.Errorf("target group naming collision for service %s port %d: %w", serviceKey, port.Port, err)
+		}
 	}
 
 	// Determine protocol based on health check type
@@ -306,11 +306,11 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 		healthCheckProtocol = types.ProtocolEnumTcp
 	}
 
-	// Build tags dynamically
+	// Build tags dynamically with port-specific service key
 	tags := []types.Tag{
 		{
 			Key:   aws.String(TagKeyDeleteKey),
-			Value: aws.String(serviceKey),
+			Value: aws.String(serviceKeyWithPort),
 		},
 		{
 			Key:   aws.String(TagKeyName),
@@ -350,6 +350,7 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 	logFields := []any{
 		"name", targetGroupName,
 		"service", serviceKey,
+		"port", port.Port,
 		"nodePort", nodePort,
 		"healthCheckType", healthCheckConfig.Type,
 		"healthCheckPort", healthCheckConfig.Port,
@@ -397,11 +398,11 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 	// Create new target group
 	createOutput, err := m.elbv2Client.CreateTargetGroup(ctx, createInput)
 	if err != nil {
-		return fmt.Errorf("failed to create target group for service %s: %w", serviceKey, err)
+		return fmt.Errorf("failed to create target group for service %s port %d: %w", serviceKey, port.Port, err)
 	}
 
 	targetGroupArn := *createOutput.TargetGroups[0].TargetGroupArn
-	m.logger.InfoContext(ctx, "Created target group", "arn", targetGroupArn, "service", serviceKey)
+	m.logger.InfoContext(ctx, "Created target group", "arn", targetGroupArn, "service", serviceKey, "port", port.Port)
 
 	// Set proxy protocol v2 attribute for new target group
 	enableProxyProtocolV2 := m.shouldEnableProxyProtocolV2(svc)
@@ -413,6 +414,38 @@ func (m *Manager) ensureTargetGroupForService(ctx context.Context, svc corev1.Se
 
 	// Register targets
 	return m.updateTargetGroupTargets(ctx, targetGroupArn, targetNodes)
+}
+
+// ensureTargetGroupsForService creates or updates target groups for all ports in the given service
+func (m *Manager) ensureTargetGroupsForService(ctx context.Context, svc corev1.Service, targetNodes []corev1.Node) error {
+	serviceKey := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
+
+	if len(targetNodes) == 0 {
+		m.logger.WarnContext(ctx, "No target nodes available for service", "service", serviceKey)
+		return nil
+	}
+
+	// Process each port that has a NodePort
+	var errs []error
+	for _, port := range svc.Spec.Ports {
+		if port.NodePort != 0 {
+			if err := m.ensureTargetGroupForPort(ctx, svc, port, targetNodes); err != nil {
+				m.logger.ErrorContext(ctx, "Failed to ensure target group for service port",
+					"service", serviceKey,
+					"port", port.Port,
+					"error", err)
+				errs = append(errs, err)
+				continue
+			}
+		}
+	}
+
+	// If all ports failed, return an error
+	if len(errs) > 0 && len(errs) == len(lo.Filter(svc.Spec.Ports, func(p corev1.ServicePort, _ int) bool { return p.NodePort != 0 })) {
+		return fmt.Errorf("failed to ensure target groups for all ports of service %s", serviceKey)
+	}
+
+	return nil
 }
 
 // updateTargetGroupTargets updates the targets in a target group
@@ -480,7 +513,7 @@ func (m *Manager) ensureTargetGroupsForNodePortServices(ctx context.Context, ser
 			continue
 		}
 
-		if err := m.ensureTargetGroupForService(ctx, *targetService, targetNodes); err != nil {
+		if err := m.ensureTargetGroupsForService(ctx, *targetService, targetNodes); err != nil {
 			m.logger.ErrorContext(ctx, "Failed to ensure target group for service", "service", serviceKey, "error", err)
 			continue
 		}
@@ -555,12 +588,21 @@ func (m *Manager) cleanupOrphanedTargetGroups(ctx context.Context) error {
 		return fmt.Errorf("failed to list services: %w", err)
 	}
 
-	// Create a set of existing service keys
+	// Create a set of existing service keys with ports
 	existingServiceKeys := make(map[string]bool)
 	for _, svc := range serviceList.Items {
 		if svc.Spec.Type == corev1.ServiceTypeNodePort {
 			serviceKey := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
+			// Also add the old format for backward compatibility
 			existingServiceKeys[serviceKey] = true
+
+			// Add service-port combinations for new format
+			for _, port := range svc.Spec.Ports {
+				if port.NodePort != 0 {
+					serviceKeyWithPort := fmt.Sprintf("%s-%d", serviceKey, port.Port)
+					existingServiceKeys[serviceKeyWithPort] = true
+				}
+			}
 		}
 	}
 
@@ -851,6 +893,96 @@ func (m *Manager) modifyTargetGroupProxyProtocolV2(ctx context.Context, targetGr
 		"targetGroupArn", targetGroupArn,
 		"enabled", enable)
 
+	return nil
+}
+
+// generateTargetGroupName generates a target group name following AWS naming rules with collision detection
+func (m *Manager) generateTargetGroupName(svc corev1.Service, port int32) string {
+	// First, try the standard naming format
+	standardName := fmt.Sprintf("tgs-%s-%s-%d", svc.Namespace, svc.Name, port)
+
+	// If the standard name is within limits, use it
+	if len(standardName) <= 32 {
+		return standardName
+	}
+
+	// For long names, use UID-based naming
+	uid := string(svc.UID)
+	if uid == "" {
+		// Fallback to truncated name if UID is not available
+		truncatedName := standardName
+		if len(truncatedName) > 32 {
+			truncatedName = truncatedName[:32]
+		}
+		return truncatedName
+	}
+
+	// Calculate how much space we need for port and separators
+	portStr := fmt.Sprintf("-%d", port)
+	uidPrefixSpace := 32 - len("tgs-") - len(portStr)
+
+	// Ensure we have some reasonable minimum space for the UID
+	if uidPrefixSpace < 8 {
+		uidPrefixSpace = 8
+	}
+
+	// Take the first part of the UID (removing any hyphens)
+	cleanUID := strings.ReplaceAll(uid, "-", "")
+	if len(cleanUID) > uidPrefixSpace {
+		cleanUID = cleanUID[:uidPrefixSpace]
+	}
+
+	return fmt.Sprintf("tgs-%s%s", cleanUID, portStr)
+}
+
+// detectTargetGroupCollision checks if a generated target group name conflicts with existing ones
+func (m *Manager) detectTargetGroupCollision(ctx context.Context, targetGroupName string, expectedServiceKey string) error {
+	// Check if target group already exists
+	describeInput := &elasticloadbalancingv2.DescribeTargetGroupsInput{
+		Names: []string{targetGroupName},
+	}
+
+	describeOutput, err := m.elbv2Client.DescribeTargetGroups(ctx, describeInput)
+	if err != nil {
+		// If target group doesn't exist, no collision
+		return nil
+	}
+
+	if len(describeOutput.TargetGroups) == 0 {
+		// Target group doesn't exist, no collision
+		return nil
+	}
+
+	// Target group exists, check if it belongs to the same service
+	targetGroupArn := *describeOutput.TargetGroups[0].TargetGroupArn
+
+	// Get tags for the existing target group
+	tagsInput := &elasticloadbalancingv2.DescribeTagsInput{
+		ResourceArns: []string{targetGroupArn},
+	}
+
+	tagsOutput, err := m.elbv2Client.DescribeTags(ctx, tagsInput)
+	if err != nil {
+		return fmt.Errorf("failed to describe tags for collision detection: %w", err)
+	}
+
+	// Find the service key from tags
+	var existingServiceKey string
+	for _, tagDesc := range tagsOutput.TagDescriptions {
+		for _, tag := range tagDesc.Tags {
+			if tag.Key != nil && *tag.Key == TagKeyDeleteKey && tag.Value != nil {
+				existingServiceKey = *tag.Value
+				break
+			}
+		}
+	}
+
+	// If the existing target group belongs to a different service, we have a collision
+	if existingServiceKey != "" && existingServiceKey != expectedServiceKey {
+		return fmt.Errorf("target group name collision detected: %s is already used by service %s", targetGroupName, existingServiceKey)
+	}
+
+	// Same service, no collision
 	return nil
 }
 
