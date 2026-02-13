@@ -2248,7 +2248,6 @@ func TestGetCurrentProxyProtocolV2Setting(t *testing.T) {
 	}
 }
 
-
 func TestGenerateTargetGroupName(t *testing.T) {
 	tests := []struct {
 		name        string
