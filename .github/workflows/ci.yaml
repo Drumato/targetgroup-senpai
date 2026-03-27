@@ -24,10 +24,10 @@ jobs:
       run: go mod download
 
     - name: Run tests
-      run: make
+      run: go test -v ./...
 
     - name: Build binary
       run: go build -o targetgroup-senpai .
 
     - name: golangci-lint
-      uses: golangci/golangci-lint-action@v8
+      uses: golangci/golangci-lint-action@v9
