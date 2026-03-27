@@ -547,10 +547,7 @@ func (m *Manager) cleanupOrphanedTargetGroups(ctx context.Context) error {
 	const maxResourcesPerDescribeTagsCall = 20
 
 	for i := 0; i < len(targetGroupArns); i += maxResourcesPerDescribeTagsCall {
-		end := i + maxResourcesPerDescribeTagsCall
-		if end > len(targetGroupArns) {
-			end = len(targetGroupArns)
-		}
+		end := min(i+maxResourcesPerDescribeTagsCall, len(targetGroupArns))
 
 		chunk := targetGroupArns[i:end]
 		describeTagsInput := &elasticloadbalancingv2.DescribeTagsInput{
@@ -919,12 +916,9 @@ func (m *Manager) generateTargetGroupName(svc corev1.Service, port int32) string
 
 	// Calculate how much space we need for port and separators
 	portStr := fmt.Sprintf("-%d", port)
-	uidPrefixSpace := 32 - len("tgs-") - len(portStr)
-
-	// Ensure we have some reasonable minimum space for the UID
-	if uidPrefixSpace < 8 {
-		uidPrefixSpace = 8
-	}
+	uidPrefixSpace := max(
+		// Ensure we have some reasonable minimum space for the UID
+		32-len("tgs-")-len(portStr), 8)
 
 	// Take the first part of the UID (removing any hyphens)
 	cleanUID := strings.ReplaceAll(uid, "-", "")

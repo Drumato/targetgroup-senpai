@@ -61,8 +61,8 @@ type Config struct {
 
 type configField struct {
 	envKey       string
-	value        interface{}
-	defaultValue interface{}
+	value        any
+	defaultValue any
 	optional     bool
 }
 
