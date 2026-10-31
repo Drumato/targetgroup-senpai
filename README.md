@@ -32,7 +32,7 @@ targetgroup-senpai operates as a Kubernetes controller that:
 ## Prerequisites
 
 ### Kubernetes Cluster
-- Kubernetes 1.20+ (tested with controller-runtime v0.22.4)
+- Kubernetes 1.20+ (tested with controller-runtime v0.25.2)
 - NodePort services that need Target Group integration
 - Cluster nodes running on AWS EC2 instances
 
